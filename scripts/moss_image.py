@@ -615,6 +615,15 @@ class MOSSImagePanel(scripts.Script):
                 inputs=[component], outputs=[self.panel, self.current],
                 queue=False, show_progress=False,
             )
+            # 每次打开 / 刷新页面也按当前预设显示：有的 Forge 版本 UI Preset 在页面加载时才读当前设置，
+            # 不会触发 change，界面构建时（启动时预设不是 moss）面板会一直隐藏
+            from gradio.context import Context
+
+            if Context.root_block is not None:
+                Context.root_block.load(
+                    fn=lambda: (gr.update(visible=is_moss_preset()), current_model_text()),
+                    outputs=[self.panel, self.current], queue=False, show_progress=False,
+                )
         elif elem_id in ("setting_sd_model_checkpoint", "setting_sd_modules"):
             # 等 Forge 把新选择写入设置后再刷新显示
             component.change(fn=lambda *_: current_model_text(), inputs=[], outputs=[self.current],
