@@ -65,7 +65,8 @@ F:\mod\
 ### 其他功能
 
 - **LoRA**：提示词里写 `<lora:文件名:权重>`（LoRA 放在 LoRA 目录）。只作用于主模型，不修改文本编码器；
-  支持 diffusers / PEFT、ComfyUI、kohya 三种键名格式，也能用在压缩版主模型上。
+  支持 diffusers / PEFT、ComfyUI、kohya 三种键名格式；ComfyUI 原生格式训练的 LoRA（合并的 qkv、norm 层 `.diff` 增量，
+  如 Kijai/MOSS-image_experimental）也能用，并且能用在压缩版主模型上。
 - **Hires. fix**：用原生的 Hires. fix。Latent 放大方式会自动改为 Lanczos 像素放大
   （MOSS 的 latent 不是普通 4 通道格式）。
 - **img2img / 局部重绘**：原生 img2img 标签页。官方没有提供编辑模型，这里采用「VAE 编码 → 按重绘幅度加噪 → 重绘」；
@@ -79,8 +80,10 @@ F:\mod\
 
 | 类型 | 来源 | 说明 |
 |---|---|---|
-| GGUF Q8_0 / Q5_1 / Q4_1 | 面板「制作压缩版模型」一键生成（约 1 分钟） | 也能加载其他工具生成的 Q6_K / Q5_K / Q4_K 等 |
-| ConvRot INT8 / INT4 主模型 | ComfyUI 社区（nif0、toxicdog 等） | 面板可直接下载 |
+| GGUF Q8_0 / Q5_1 / Q4_1 | 面板「制作压缩版模型」一键生成（约 1 分钟） | 也能加载其他工具生成的 Q2_K～Q8_0（如 realrebelai/MOSS-Image_GGUFs） |
+| ComfyUI 官方包 bf16 / INT8 主模型 | [Comfy-Org/MOSS-Image](https://huggingface.co/Comfy-Org/MOSS-Image) | ComfyUI 原生格式（q/k/v 合并为 qkv），加载时自动拆分，与官方逐位一致 |
+| ComfyUI 官方包 INT8 文本编码器 / VAE | Comfy-Org/MOSS-Image | 直接可用 |
+| ConvRot INT8 / INT4 主模型 | ComfyUI 社区（nif0、Abiray、toxicdog、SumomoLee 等） | 面板可直接下载 |
 | ConvRot INT8 文本编码器 | ComfyUI 社区（Abiray 等） | 面板可直接下载 |
 
 压缩版只替换主模型 / 文本编码器 / VAE 本身，配置和分词器仍来自官方目录：只用压缩版时下载「官方配置包」（约 20M）即可。
@@ -115,6 +118,8 @@ F:\mod\
 - img2img「仅重绘蒙版区域」暂不支持（按整图重绘并保留蒙版外内容）。
 - 生成过程中没有中间预览图，只有进度条。
 - 社区 W4A8 GPTQ 文本编码器暂不支持（INT8 版可用）。
+- darask0 / akhaliq 的「4 步加速」适配器除了 LoRA 还带自定义时间嵌入和采样数据，需要专门的采样器，暂不支持
+  （其中的 LoRA 部分能加载，但单独使用达不到 4 步出图）。
 - INT4 主模型画质明显下降（每层权重误差约 15–18%，属于该文件本身）。
 - 需要 NVIDIA CUDA 显卡。
 

@@ -143,6 +143,20 @@ def _strip_prefix(name):
     return name
 
 
+# ComfyUI 原生格式（Comfy-Org/MOSS-Image 等）把每层的 q / k / v 合并成一个 proj.qkv（按行依次拼接），
+# 已用 Comfy-Org bf16 文件逐位验证：qkv.chunk(3, 0) == (官方 q, k, v)。加载时按行拆回三层。
+def _qkv_parts(module_name):
+    """layers.N.proj.qkv -> [layers.N.proj.q, .k, .v]；不是合并层时返回 None"""
+    if module_name.endswith(".proj.qkv"):
+        base = module_name[: -len("qkv")]
+        return [base + c for c in "qkv"]
+    return None
+
+
+# 加载时忽略的附加张量：量化参数、ComfyUI 的注意力配置
+_SKIP_SUFFIXES = (".comfy_quant", ".weight_scale", ".input_scale", ".comfy_attention.config")
+
+
 def load_safetensors_transformer(path, config_path):
     """ComfyUI 单文件 DiT：ConvRot INT8（每层 comfy_quant）/ W4A4（_quantization_metadata）/ 普通 bf16。"""
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -169,29 +183,43 @@ def load_safetensors_transformer(path, config_path):
                 kind = "int4"
             else:
                 raise ValueError(f"不支持的 ComfyUI 量化格式：{module_name} -> {info}")
-            old = modules.get(module_name)
-            if not isinstance(old, nn.Linear):
-                raise ValueError(f"量化层 {module_name} 不是 MOSS-Image DiT 的线性层（这不是 MOSS-Image 的模型文件？）")
             qweight = f.get_tensor(names[module_name + ".weight"])
-            scale = f.get_tensor(names[module_name + ".weight_scale"])
-            expect_in = old.in_features // 2 if kind == "int4" else old.in_features
-            if tuple(qweight.shape) != (old.out_features, expect_in) or scale.numel() != old.out_features:
-                raise ValueError(f"{module_name} 的量化张量形状不符：{tuple(qweight.shape)} / {tuple(scale.shape)}")
+            scale = f.get_tensor(names[module_name + ".weight_scale"]).reshape(-1)
             bias = f.get_tensor(names[module_name + ".bias"]) if module_name + ".bias" in names else None
-            parent_name, child = module_name.rsplit(".", 1)
-            setattr(modules[parent_name], child, ConvRotLinear(
-                qweight, scale, kind, int(info.get("convrot_groupsize", 256)),
-                old.in_features, old.out_features, bias,
-            ))
+            # 合并的 qkv 按行拆成三层（旋转只作用于输入维度，按输出行拆分不影响反量化）
+            targets = _qkv_parts(module_name) or [module_name]
+            n = len(targets)
+            for index, target in enumerate(targets):
+                old = modules.get(target)
+                if not isinstance(old, nn.Linear):
+                    raise ValueError(f"量化层 {module_name} 不是 MOSS-Image DiT 的线性层（这不是 MOSS-Image 的模型文件？）")
+                rows = slice(index * old.out_features, (index + 1) * old.out_features)
+                part_q = qweight[rows] if n > 1 else qweight
+                part_s = scale[rows] if n > 1 else scale
+                part_b = None if bias is None else (bias[rows] if n > 1 else bias)
+                expect_in = old.in_features // 2 if kind == "int4" else old.in_features
+                if tuple(part_q.shape) != (old.out_features, expect_in) or part_s.numel() != old.out_features:
+                    raise ValueError(f"{module_name} 的量化张量形状不符：{tuple(qweight.shape)} / {tuple(scale.shape)}")
+                parent_name, child = target.rsplit(".", 1)
+                setattr(modules[parent_name], child, ConvRotLinear(
+                    part_q.contiguous(), part_s.contiguous(), kind, int(info.get("convrot_groupsize", 256)),
+                    old.in_features, old.out_features, part_b,
+                ))
+                loaded.update({target + ".weight", target + ".bias"})
+                quantized += 1
             loaded.update({module_name + ".weight", module_name + ".bias"})
-            quantized += 1
-        skip_suffixes = (".comfy_quant", ".weight_scale", ".input_scale")
         for name, raw in names.items():
-            if name in loaded or name.endswith(skip_suffixes) or name == "rope.bands":
+            if name in loaded or name.endswith(_SKIP_SUFFIXES) or name == "rope.bands":
+                continue
+            parts = _qkv_parts(name[: -len(".weight")]) if name.endswith(".weight") else None
+            if parts is not None:  # 非量化的合并 qkv（Comfy-Org bf16）
+                for target, value in zip(parts, f.get_tensor(raw).chunk(3, 0)):
+                    set_module_tensor_to_device(transformer, target + ".weight", "cpu", value=value.to(torch.bfloat16), dtype=torch.bfloat16)
+                    loaded.add(target + ".weight")
                 continue
             if name not in params:
                 raise ValueError(f"文件中存在 MOSS-Image DiT 没有的张量：{name}（这不是 MOSS-Image 的 DiT 文件）")
-            set_module_tensor_to_device(transformer, name, "cpu", value=f.get_tensor(raw).to(torch.bfloat16))
+            set_module_tensor_to_device(transformer, name, "cpu", value=f.get_tensor(raw).to(torch.bfloat16), dtype=torch.bfloat16)
             loaded.add(name)
     missing = [name for name in params if name not in loaded]  # 替换前的官方参数表
     if missing:
@@ -218,28 +246,32 @@ def load_gguf_transformer(path, config_path):
         name = _strip_prefix(name)
         if name == "rope.bands":
             continue  # RoPE 频率按配置重新计算
+        if name.endswith(_SKIP_SUFFIXES):
+            continue
         data = torch.from_numpy(np.array(tensor.data))
-        if name not in params:
-            raise ValueError(f"GGUF 中存在 MOSS-Image DiT 没有的张量：{name}（这不是 MOSS-Image 的 GGUF）")
-        if qtype in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.BF16):
-            if qtype == gguf.GGMLQuantizationType.BF16:
-                value = data.view(torch.int16).view(torch.bfloat16)
+        # 合并的 qkv（ComfyUI 原生格式转出的 GGUF）：量化块按行存储，按行拆成三份即可
+        parts = _qkv_parts(name[: -len(".weight")]) if name.endswith(".weight") else None
+        targets = [p + ".weight" for p in parts] if parts else [name]
+        chunks = data.chunk(3, 0) if parts else [data]
+        for target, chunk in zip(targets, chunks):
+            if target not in params:
+                raise ValueError(f"GGUF 中存在 MOSS-Image DiT 没有的张量：{name}（这不是 MOSS-Image 的 GGUF）")
+            part_shape = tuple(params[target].shape) if parts else shape
+            if qtype in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.BF16):
+                value = chunk.contiguous().view(torch.int16).view(torch.bfloat16) if qtype == gguf.GGMLQuantizationType.BF16 else chunk
+                # 与官方 bf16 加载一致：norm / embedding 等非量化张量统一为 bf16
+                set_module_tensor_to_device(transformer, target, "cpu", value=value.reshape(part_shape).to(torch.bfloat16), dtype=torch.bfloat16)
             else:
-                value = data
-            value = value.reshape(shape)
-            # 与官方 bf16 加载一致：norm / embedding 等非量化张量统一为 bf16
-            set_module_tensor_to_device(transformer, name, "cpu", value=value.to(torch.bfloat16))
-        else:
-            if qtype not in QUANTS_MAPPING:
-                raise ValueError(f"不支持的 GGUF 量化类型：{qtype.name}（{name}）")
-            module_name = name.rsplit(".", 1)[0]
-            parent_name, child = module_name.rsplit(".", 1)
-            old = modules[module_name]
-            if not isinstance(old, nn.Linear) or old.bias is not None or shape != tuple(old.weight.shape):
-                raise ValueError(f"{name} 不是可量化的无 bias 线性层或形状不符：{shape}")
-            setattr(modules[parent_name], child, GGUFLinear(data, qtype, old.in_features, old.out_features))
-            quantized += 1
-        loaded.add(name)
+                if qtype not in QUANTS_MAPPING:
+                    raise ValueError(f"不支持的 GGUF 量化类型：{qtype.name}（{name}）")
+                module_name = target.rsplit(".", 1)[0]
+                parent_name, child = module_name.rsplit(".", 1)
+                old = modules[module_name]
+                if not isinstance(old, nn.Linear) or old.bias is not None or part_shape != tuple(old.weight.shape):
+                    raise ValueError(f"{name} 不是可量化的无 bias 线性层或形状不符：{shape}")
+                setattr(modules[parent_name], child, GGUFLinear(chunk.contiguous(), qtype, old.in_features, old.out_features))
+                quantized += 1
+            loaded.add(target)
     missing = [name for name in params if name not in loaded]
     if missing:
         raise ValueError(f"GGUF 缺少 {len(missing)} 个张量，例如 {missing[:3]}")
@@ -357,7 +389,7 @@ def load_qwen35_quant_file(path, config_root):
                 continue
             if name not in expected:
                 raise ValueError(f"文本编码器文件中存在未知张量：{raw_name}（这不是 MOSS-Image 的 Qwen3.5？）")
-            set_module_tensor_to_device(model, name, "cpu", value=f.get_tensor(raw_name).to(torch.bfloat16))
+            set_module_tensor_to_device(model, name, "cpu", value=f.get_tensor(raw_name).to(torch.bfloat16), dtype=torch.bfloat16)
             loaded.add(name)
     missing = sorted(expected - loaded)
     if missing:
