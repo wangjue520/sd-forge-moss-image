@@ -440,10 +440,10 @@ if not getattr(opts, f"forge_checkpoint_{PRESET}", None) and checkpoints.default
     opts.set(f"forge_checkpoint_{PRESET}", checkpoints.default_checkpoint().name)
 
 
-def current_model_text():
+def current_model_text(p=None):
     if not is_moss_preset():
         return ""
-    return checkpoints.describe(checkpoints.selected_checkpoint(), checkpoints.selected_modules())
+    return checkpoints.describe(checkpoints.selected_checkpoint(p), checkpoints.selected_modules(p))
 
 
 # ---------------------------------------------------------------- 下载
@@ -581,8 +581,12 @@ def wire_top_bar(component, **kwargs):
 
     这些下拉框在 Quicksettings 里，创建时 txt2img / img2img 的界面已经建完（scripts_current 为 None），
     Script.after_component 收不到，所以用全局的 script_callbacks.on_after_component。"""
+    from gradio.context import Context
+
     elem_id = kwargs.get("elem_id") or getattr(component, "elem_id", None)
-    if not PANELS:
+    # gradio 处理 gr.update() 时会在 Blocks 外临时重建同 elem_id 的组件（页面加载刷新模型列表就会触发），
+    # 这些临时组件不在界面里，跳过；界面里的那份在建 UI 时已经接好了。
+    if not PANELS or Context.root_block is None:
         return
     if elem_id == "forge_ui_preset":
         component.change(
@@ -590,19 +594,30 @@ def wire_top_bar(component, **kwargs):
             inputs=[component], outputs=_panel_outputs(), queue=False, show_progress=False,
         )
         # 打开 / 刷新页面时也按当前预设显示（启动时预设不是 moss、之后才切过来的情况）
-        from gradio.context import Context
-
-        if Context.root_block is not None:
-            Context.root_block.load(
-                fn=lambda: _panel_updates(is_moss_preset()),
-                outputs=_panel_outputs(), queue=False, show_progress=False,
-            )
-    elif elem_id in ("setting_sd_model_checkpoint", "setting_sd_modules"):
-        # 等 Forge 把新选择写入设置后再刷新显示
-        component.change(
-            fn=lambda *_: [current_model_text()] * len(PANELS),
-            inputs=[], outputs=[current for _, current in PANELS], queue=False, show_progress=False,
+        Context.root_block.load(
+            fn=lambda: _panel_updates(is_moss_preset()),
+            outputs=_panel_outputs(), queue=False, show_progress=False,
         )
+    elif elem_id in ("setting_sd_model_checkpoint", "setting_sd_modules"):
+        # 前端先发 change、后发 Forge 写入设置的 input，所以按下拉框传来的新值显示，不读设置
+        component.change(
+            fn=lambda value: [current_model_text(_top_bar_selection(elem_id, value))] * len(PANELS),
+            inputs=[component], outputs=[current for _, current in PANELS], queue=False, show_progress=False,
+        )
+
+
+def _top_bar_selection(elem_id, value):
+    """顶部下拉框的新值 -> current_model_text 用的 override_settings（模块名换成路径，同 Forge 的 modules_change）。"""
+    from types import SimpleNamespace
+
+    if elem_id == "setting_sd_model_checkpoint":
+        return SimpleNamespace(override_settings={"sd_model_checkpoint": value})
+    from modules_forge import main_entry
+
+    names = [os.path.basename(v) for v in value or []]
+    return SimpleNamespace(override_settings={
+        "forge_additional_modules": sorted(main_entry.module_list[name] for name in names if name in main_entry.module_list),
+    })
 
 
 script_callbacks.on_after_component(wire_top_bar, name="moss_image_top_bar")
