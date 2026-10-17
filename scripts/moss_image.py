@@ -19,12 +19,14 @@ import torch
 from PIL import Image, ImageFilter, ImageOps
 from torch.nn import functional as F
 
-from lib_moss_image.download import CATALOG, MEMORY_HINT, SOURCES, download_items, gpu_info, item_choices, recommend
+from lib_moss_image.download import (
+    CATALOG, MEMORY_HINT, SOURCES, TURBO_LORA, TURBO_STEPS, download_items, gpu_info, item_choices, recommend,
+)
 from lib_moss_image.layout import validate_layout
 from lib_moss_image.pipeline import Interrupted
 from lib_moss_image import checkpoints
 from lib_moss_image.runtime import MODEL_NAMES, available_configs, available_models, manager, model_roots, models_root, parse_layers
-from modules import extra_networks, images, infotext_utils, sd_models, scripts, shared
+from modules import extra_networks, images, infotext_utils, script_callbacks, sd_models, scripts, shared
 from modules.infotext_utils import PasteField
 from modules.processing import Processed, StableDiffusionProcessingImg2Img, create_binary_mask, fix_seed
 from modules.shared import opts, state
@@ -56,6 +58,7 @@ DEFAULT_OPTIONS = {
     "layers": "22",
     "memory_mode": "model",
     "keep_loaded": False,
+    "turbo": False,
 }
 
 
@@ -90,6 +93,9 @@ def find_lora(name):
             for path in shared.walk_files(folder, allowed_extensions=[".safetensors"]):
                 if os.path.splitext(os.path.basename(path))[0] == name:
                     return path
+    if name == TURBO_LORA:
+        raise FileNotFoundError("还没有下载 8 步加速 LoRA：请在 MOSS-Image 面板点「下载加速 LoRA」（约 1.2G），"
+                                "或在「模型下载」里勾选「8 步加速 LoRA」。")
     raise FileNotFoundError(f"找不到 LoRA：{name}（请放到 models/Lora）")
 
 
@@ -103,6 +109,14 @@ def resolve_loras(network_data):
         if network != "lora":
             print(f"[MOSS-Image] 不支持的额外网络 <{network}:...>，已忽略。")
     return loras
+
+
+def add_turbo_lora(loras):
+    """加速模式：自动加上 DMD LoRA（权重 1）；提示词里已经手动写了就保持用户的权重。"""
+    path = find_lora(TURBO_LORA)
+    if any(os.path.normcase(lora_path) == os.path.normcase(path) for _, lora_path, _ in loras):
+        return loras
+    return [*loras, (TURBO_LORA, path, 1.0)]
 
 
 def lora_text(loras):
@@ -177,6 +191,7 @@ def make_infotext(p, index, prompt, settings, extra):
         "MOSS SLG interval": "0.01-1.0" if settings["slg_mode"] == "standard" else "0-1",
         "MOSS memory": settings["memory_mode"],
         "MOSS keep loaded": bool(settings["keep_loaded"]),
+        "MOSS turbo": True if settings["turbo"] else None,
         "MOSS LoRA": settings["lora_text"],
     }
     text = ", ".join(
@@ -214,6 +229,7 @@ def process_moss(p):
     options = {**DEFAULT_OPTIONS, **getattr(p, "moss_options", {})}
     slg_mode, memory_mode = options["slg_mode"], options["memory_mode"]
     keep_loaded = bool(options["keep_loaded"])
+    turbo = bool(options["turbo"])
     # 模型来自顶部 Checkpoint（API 可用 override_settings.sd_model_checkpoint 指定）
     info = checkpoints.selected_checkpoint(p)
     if info is None:
@@ -238,6 +254,15 @@ def process_moss(p):
     shift = float(p.distilled_cfg_scale)
     if not math.isfinite(shift) or shift <= 0:
         raise ValueError("Shift 必须是正数。")
+    if turbo:
+        # 蒸馏模型：最多 8 步（更少也行，每个前缀都训练过），不用 CFG（CFG=1 时负向提示词不参与，速度再翻倍）
+        p.steps = min(int(p.steps), TURBO_STEPS)
+        p.cfg_scale = 1.0
+        if getattr(p, "enable_hr", False):
+            p.hr_second_pass_steps = min(int(p.hr_second_pass_steps or p.steps), TURBO_STEPS)
+            p.hr_cfg = 1.0
+        if model != "SFT":
+            print("[MOSS-Image] 8 步加速 LoRA 是在 SFT 上蒸馏的，用在 Base 上效果可能变差。")
 
     p.width, p.height = align_16(p.width), align_16(p.height)
     p.sampler_name = "Euler"
@@ -255,6 +280,8 @@ def process_moss(p):
     # <lora:名称:权重> 从 prompt 中取出，只作用于 DiT；infotext 保留原 prompt 方便复现
     prompts, network_data = extra_networks.parse_prompts(list(p.all_prompts))
     loras = resolve_loras(network_data)
+    if turbo:
+        loras = add_turbo_lora(loras)
     for prompt in prompts:
         validate_layout(prompt, p.width, p.height)
 
@@ -266,6 +293,8 @@ def process_moss(p):
         hr_steps = int(p.hr_second_pass_steps or p.steps)
         hr_prompts, hr_network_data = extra_networks.parse_prompts(list(p.all_hr_prompts))
         hr_loras = resolve_loras(hr_network_data)
+        if turbo:
+            hr_loras = add_turbo_lora(hr_loras)
         hr_extra = {
             "Denoising strength": float(p.denoising_strength),
             "Hires upscale": getattr(p, "hr_scale", None) if not (p.hr_resize_x or p.hr_resize_y) else None,
@@ -286,7 +315,8 @@ def process_moss(p):
 
     settings = {
         "model": model, "shift": shift, "slg_mode": slg_mode, "layers": layers,
-        "memory_mode": memory_mode, "keep_loaded": keep_loaded, "lora_text": lora_text(loras), "te": te, "vae": vae,
+        "memory_mode": memory_mode, "keep_loaded": keep_loaded, "turbo": turbo,
+        "lora_text": lora_text(loras), "te": te, "vae": vae,
         "checkpoint": info.name,
     }
     common = dict(model=model, offload=memory_mode, dit=dit, te=te, vae=vae, num_images_per_prompt=1,
@@ -424,14 +454,20 @@ def download_dirs():
 
     te_dirs = getattr(shared.cmd_opts, "text_encoder_dirs", None) or [str(Path(paths.models_path) / "text_encoder")]
     vae_dirs = getattr(shared.cmd_opts, "vae_dirs", None) or [str(Path(paths.models_path) / "VAE")]
-    return {"moss": models_root(), "te": Path(te_dirs[0]), "vae": Path(vae_dirs[0])}
+    lora_dirs = getattr(shared.cmd_opts, "lora_dirs", None) or [shared.cmd_opts.lora_dir]
+    return {"moss": models_root(), "te": Path(te_dirs[0]), "vae": Path(vae_dirs[0]), "lora": Path(lora_dirs[0]) / "MOSS"}
 
 
 def _installed(key):
     item, dirs = CATALOG[key], download_dirs()
     if item.model is not None:
         return item.model in (available_models() if item.weights else available_configs())
-    return (dirs[item.dest] / Path(item.path).name).is_file()
+    if item.dest == "lora":
+        try:
+            return bool(find_lora(Path(item.saved_name).stem))
+        except FileNotFoundError:
+            return False
+    return (dirs[item.dest] / item.saved_name).is_file()
 
 
 def model_status():
@@ -440,7 +476,7 @@ def model_status():
     dirs = download_dirs()
     return (
         "**本地已有**\n\n" + "\n".join(lines)
-        + f"\n\n保存位置：主模型 `{dirs['moss']}`；文本编码器 `{dirs['te']}`；VAE `{dirs['vae']}`"
+        + f"\n\n保存位置：主模型 `{dirs['moss']}`；文本编码器 `{dirs['te']}`；VAE `{dirs['vae']}`；LoRA `{dirs['lora']}`"
     )
 
 
@@ -455,7 +491,8 @@ def recommendation_text():
         f"检测到显卡：**{name}（{vram:.0f}G 显存）**\n\n"
         f"推荐下载：**{items}**（共约 {size:.1f}G）——{reason}。\n\n"
         f"下载后：顶部 Checkpoint 选{MEMORY_HINT[tuple(keys)]}，"
-        f"「显存使用方式」选「{MEMORY_LABELS[memory_mode]}」。"
+        f"「显存使用方式」选「{MEMORY_LABELS[memory_mode]}」。\n\n"
+        "想出图更快：再下载「8 步加速 LoRA」（约 1.2G），勾选「8 步加速模式」，一张图从 50 步缩短到 8 步。"
     )
 
 
@@ -472,6 +509,31 @@ def run_download(keys, source, custom_endpoint):
         yield f"{text}\n\n下载完成，点顶部 Checkpoint 旁的刷新按钮即可选择。\n\n{model_status()}"
     except Exception as error:
         yield f"{text}\n\n下载中断（再次点击会从断点继续，也可以换一个下载源）：{error}"
+
+
+def turbo_status():
+    return "✅ 加速 LoRA 已下载" if _installed("turbo_lora") else "⬜ 还没有下载加速 LoRA（约 1.2G）"
+
+
+def run_turbo_download(source, custom_endpoint):
+    if _installed("turbo_lora"):
+        yield turbo_status()
+        return
+    text = ""
+    for text in run_download(["turbo_lora"], source, custom_endpoint):
+        yield text.split("\n\n")[0]
+    if _installed("turbo_lora"):
+        yield f"{turbo_status()}，勾选「8 步加速模式」即可使用。"
+    else:
+        yield text
+
+
+def turbo_slider_values(on, is_img2img):
+    """加速模式开 = 8 步 / CFG 1；关 = 回到 moss 预设的默认值（设置里可改，官方 50 / 3）。"""
+    if on:
+        return TURBO_STEPS, 1.0
+    tab = "i2i" if is_img2img else "t2i"
+    return (getattr(opts, f"{PRESET}_{tab}_step", 50) or 50), (getattr(opts, f"{PRESET}_{tab}_cfg", 3.0) or 3.0)
 
 
 def run_recommended(source, custom_endpoint):
@@ -501,6 +563,51 @@ def run_convert(model, label):
 
 # ---------------------------------------------------------------- UI
 
+# txt2img / img2img 两个面板：(Accordion, 当前模型 Markdown)
+PANELS = []
+
+
+def _panel_updates(visible):
+    text = current_model_text()
+    return [value for _ in PANELS for value in (gr.update(visible=visible), text)]
+
+
+def _panel_outputs():
+    return [component for pair in PANELS for component in pair]
+
+
+def wire_top_bar(component, **kwargs):
+    """顶部 UI Preset / Checkpoint / VAE 下拉框联动面板。
+
+    这些下拉框在 Quicksettings 里，创建时 txt2img / img2img 的界面已经建完（scripts_current 为 None），
+    Script.after_component 收不到，所以用全局的 script_callbacks.on_after_component。"""
+    elem_id = kwargs.get("elem_id") or getattr(component, "elem_id", None)
+    if not PANELS:
+        return
+    if elem_id == "forge_ui_preset":
+        component.change(
+            fn=lambda preset: _panel_updates(preset == PRESET),
+            inputs=[component], outputs=_panel_outputs(), queue=False, show_progress=False,
+        )
+        # 打开 / 刷新页面时也按当前预设显示（启动时预设不是 moss、之后才切过来的情况）
+        from gradio.context import Context
+
+        if Context.root_block is not None:
+            Context.root_block.load(
+                fn=lambda: _panel_updates(is_moss_preset()),
+                outputs=_panel_outputs(), queue=False, show_progress=False,
+            )
+    elif elem_id in ("setting_sd_model_checkpoint", "setting_sd_modules"):
+        # 等 Forge 把新选择写入设置后再刷新显示
+        component.change(
+            fn=lambda *_: [current_model_text()] * len(PANELS),
+            inputs=[], outputs=[current for _, current in PANELS], queue=False, show_progress=False,
+        )
+
+
+script_callbacks.on_after_component(wire_top_bar, name="moss_image_top_bar")
+
+
 class MOSSImageGuard(scripts.Script):
     """非 moss 预设生成前释放 MOSS，防止两套模型抢显存。"""
 
@@ -525,6 +632,7 @@ class MOSSImagePanel(scripts.Script):
 
     def __init__(self):
         self.panel = None
+        self.sliders = {}  # 本标签页原生的 steps / cfg_scale 滑块，加速模式开关时联动
 
     def title(self):
         return "MOSS-Image"
@@ -558,6 +666,21 @@ class MOSSImagePanel(scripts.Script):
                 value=False, label="生成完不卸载模型",
                 info="勾选后连续出图不用每次重新加载（省约 30 秒），但会一直占用内存和显存；切换到其他模型时会自动释放。",
             )
+            with gr.Row(equal_height=True):
+                turbo = gr.Checkbox(
+                    value=False, label="8 步加速模式", scale=3,
+                    info="自动加载 8 步加速 LoRA（DMD 蒸馏），步数改为最多 8 步、CFG 改为 1（负向提示词不起作用），"
+                         "出图快 6~9 倍，画质接近 50 步。适用于 SFT 和它的压缩版；想更快可以把步数调到 4。",
+                )
+                turbo_download = gr.Button("下载加速 LoRA", scale=1)
+            turbo_info = gr.Markdown(turbo_status())
+            if len(self.sliders) == 2:
+                # 只响应用户点击（input），读取 PNG 信息回填时不会把回填的步数 / CFG 改掉
+                turbo.input(
+                    fn=lambda on: turbo_slider_values(on, is_img2img),
+                    inputs=[turbo], outputs=[self.sliders["steps"], self.sliders["cfg_scale"]],
+                    queue=False, show_progress=False,
+                )
             gr.Markdown(
                 "**使用说明**\n\n"
                 "- 模型在顶部 **Checkpoint** 里选：`MOSS-Image-SFT`（推荐，出图更规整）/ `MOSS-Image-Base`（原始底模），"
@@ -565,6 +688,7 @@ class MOSSImagePanel(scripts.Script):
                 "- 想用压缩版的文本编码器，在顶部「VAE / Text Encoder」里选；不选就用官方原版。\n"
                 "- 步数 / CFG / Shift 用页面上原有的滑块（官方推荐 50 / 3 / 5），宽高会自动对齐到 16 的倍数。\n"
                 "- LoRA：提示词里写 `<lora:文件名:权重>`。\n"
+                "- 想快：勾上面的「8 步加速模式」（第一次先点「下载加速 LoRA」）。\n"
                 "- 排版（Layout）：把官方格式的 JSON 直接粘贴到正向提示词，宽高要和 JSON 里的画布一致。"
             )
             with gr.Accordion("模型下载", open=False):
@@ -578,6 +702,7 @@ class MOSSImagePanel(scripts.Script):
                 download = gr.Button("下载勾选的内容")
                 status = gr.Markdown(model_status())
                 recommended.click(run_recommended, inputs=[source, custom_endpoint], outputs=[status])
+                turbo_download.click(run_turbo_download, inputs=[source, custom_endpoint], outputs=[turbo_info])
                 download.click(run_download, inputs=[items, source, custom_endpoint], outputs=[status])
             with gr.Accordion("制作压缩版模型（GGUF）", open=False):
                 from lib_moss_image.quant import CONVERT_TYPES
@@ -600,39 +725,25 @@ class MOSSImagePanel(scripts.Script):
             PasteField(layers, "MOSS SLG layers"),
             PasteField(memory_mode, "MOSS memory"),
             PasteField(keep_loaded, "MOSS keep loaded"),
+            PasteField(turbo, lambda params: params.get("MOSS turbo") == "True"),
         ]
-        self.paste_field_names = [field.label for field in self.infotext_fields]
-        return [slg_mode, layers, memory_mode, keep_loaded]
+        self.paste_field_names = ["MOSS SLG mode", "MOSS SLG layers", "MOSS memory", "MOSS keep loaded", "MOSS turbo"]
+        # 重载 UI 会重新建面板：同一个标签页只保留最新的一组
+        PANELS[:] = [pair for pair in PANELS if pair[0].elem_id != self.panel.elem_id] + [(self.panel, self.current)]
+        return [slg_mode, layers, memory_mode, keep_loaded, turbo]
 
     def after_component(self, component, **kwargs):
-        # 顶部 UI Preset / Checkpoint / VAE 下拉框在 txt2img / img2img 之后创建，这里挂上联动
-        elem_id = kwargs.get("elem_id")
-        if self.panel is None:
-            return
-        if elem_id == "forge_ui_preset":
-            component.change(
-                fn=lambda preset: (gr.update(visible=preset == PRESET), current_model_text()),
-                inputs=[component], outputs=[self.panel, self.current],
-                queue=False, show_progress=False,
-            )
-            # 每次打开 / 刷新页面也按当前预设显示：有的 Forge 版本 UI Preset 在页面加载时才读当前设置，
-            # 不会触发 change，界面构建时（启动时预设不是 moss）面板会一直隐藏
-            from gradio.context import Context
+        # 原生步数 / CFG 滑块在面板之前创建，这里记下来给加速模式开关联动
+        tab = "img2img" if self.is_img2img else "txt2img"
+        for name in ("steps", "cfg_scale"):
+            if kwargs.get("elem_id") == f"{tab}_{name}":
+                self.sliders[name] = component
 
-            if Context.root_block is not None:
-                Context.root_block.load(
-                    fn=lambda: (gr.update(visible=is_moss_preset()), current_model_text()),
-                    outputs=[self.panel, self.current], queue=False, show_progress=False,
-                )
-        elif elem_id in ("setting_sd_model_checkpoint", "setting_sd_modules"):
-            # 等 Forge 把新选择写入设置后再刷新显示
-            component.change(fn=lambda *_: current_model_text(), inputs=[], outputs=[self.current],
-                             queue=False, show_progress=False)
-
-    def before_process(self, p, slg_mode="negative", layers="22", memory_mode="model", keep_loaded=False):
+    def before_process(self, p, slg_mode="negative", layers="22", memory_mode="model", keep_loaded=False, turbo=False):
         p.moss_options = {
             "slg_mode": slg_mode,
             "layers": layers,
             "memory_mode": memory_mode,
             "keep_loaded": keep_loaded,
+            "turbo": turbo,
         }

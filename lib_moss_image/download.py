@@ -1,6 +1,7 @@
-"""MOSS-Image 下载：官方完整版 / 配置包 / 压缩版主模型 / 文本编码器 / VAE，并按显存推荐组合。
+"""MOSS-Image 下载：官方完整版 / 配置包 / 压缩版主模型 / 文本编码器 / VAE / 8 步加速 LoRA，并按显存推荐组合。
 
-- 官方仓库支持 Hugging Face、HF 镜像、ModelScope；社区压缩版只在 Hugging Face（及其镜像）上。
+- 官方仓库支持 Hugging Face、HF 镜像、ModelScope；社区文件大多只在 Hugging Face（及其镜像）上，
+  魔搭上也有的（ms_repo）直接走魔搭。
 - 不使用 huggingface_hub.snapshot_download：hf-mirror.com 重定向后缺少 X-Repo-Commit，新版会失败。
   这里直接走文件列表 API；大文件 16 路并发分块下载，分块各自断点续传。
 """
@@ -31,15 +32,26 @@ PART = 32 * 1024 * 1024  # 并发分块大小
 WORKERS = 16
 
 
+# 8 步加速：lodestones 的 DMD 蒸馏 LoRA（MOSS-Image-SFT 50 步 CFG 3 -> 8 步无 CFG），标准 Euler 采样即可
+TURBO_LORA = "MOSS-SFT-8step-DMD"
+TURBO_STEPS = 8
+
+
 @dataclass(frozen=True)
 class Item:
     label: str
-    dest: str  # "moss" / "te" / "vae"
+    dest: str  # "moss" / "te" / "vae" / "lora"
     size_gb: float
     model: str | None = None  # 官方仓库：Base / SFT
     weights: bool = True  # 官方仓库：False = 只下载配置包
     repo: str | None = None  # 社区单文件：HF 仓库
     path: str | None = None
+    filename: str | None = None  # 保存的文件名（默认同原文件名）
+    ms_repo: str | None = None  # 魔搭上的同名仓库（有就不必绕道 HF 镜像）
+
+    @property
+    def saved_name(self):
+        return self.filename or Path(self.path).name
 
 
 CATALOG = {
@@ -54,6 +66,9 @@ CATALOG = {
                     repo="Abiray/MOSS-Image-SFT-INT8-convrot", path="text_encoders/moss-image-sft-qwen35-int8-convrot.safetensors"),
     "vae_bf16": Item("VAE 单文件（bf16）", "vae", 0.125,
                      repo="nif0/MOSS-Image-SFT-ComfyUI", path="vae/moss_image_vae_bf16.safetensors"),
+    "turbo_lora": Item("8 步加速 LoRA（出图快 6~9 倍，配合「8 步加速模式」使用）", "lora", 1.19,
+                       repo="lodestones/MOSS-Image-SFT-8-steps-dmd", path="lora.safetensors",
+                       filename=f"{TURBO_LORA}.safetensors", ms_repo="lodestones/MOSS-Image-SFT-8-steps-dmd"),
 }
 
 
@@ -181,17 +196,20 @@ def _plan(key, endpoint, dirs, session):
     if item.model is not None:
         root = Path(dirs["moss"]) / item.model
         return [(root / path, size, url) for path, size, url in list_files(item.model, endpoint, session, item.weights)]
-    if _is_modelscope(endpoint):
-        endpoint = SOURCES["HF 镜像 (hf-mirror.com)"]  # 社区文件只在 HF，魔搭改走 HF 镜像
-    url = f"{endpoint.rstrip('/')}/{item.repo}/resolve/main/{quote(item.path)}"
+    if _is_modelscope(endpoint) and item.ms_repo:
+        url = f"{endpoint.rstrip('/')}/models/{item.ms_repo}/resolve/master/{quote(item.path)}"
+    else:
+        if _is_modelscope(endpoint):
+            endpoint = SOURCES["HF 镜像 (hf-mirror.com)"]  # 魔搭上没有的社区文件改走 HF 镜像
+        url = f"{endpoint.rstrip('/')}/{item.repo}/resolve/main/{quote(item.path)}"
     head = session.head(url, allow_redirects=True, timeout=60)
     head.raise_for_status()
     size = int(head.headers.get("Content-Length") or head.headers.get("X-Linked-Size") or 0)
-    return [(Path(dirs[item.dest]) / Path(item.path).name, size, url)]
+    return [(Path(dirs[item.dest]) / item.saved_name, size, url)]
 
 
 def download_items(keys, endpoint, dirs):
-    """生成器：依次下载所选项，边下载边 yield 进度文本（约每秒一次）。dirs: {"moss","te","vae"} 保存目录。"""
+    """生成器：依次下载所选项，边下载边 yield 进度文本（约每秒一次）。dirs: {"moss","te","vae","lora"} 保存目录。"""
     session = requests.Session()
     session.headers["User-Agent"] = "sd-forge-moss-image"
     files = []
