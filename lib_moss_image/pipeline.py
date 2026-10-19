@@ -300,6 +300,19 @@ class MOSSImagePipeline(DiffusionPipeline):
         self.maybe_free_model_hooks()
         return result
 
+    def decode_latents(self, latents):
+        """把 packed latent 解码成一张 PIL 图；生成中预览和最终输出共用。"""
+        if self.vae is None:
+            raise ValueError("A FLUX.2 VAE is required to decode latents.")
+        z = latents.to(dtype=self.vae.dtype)
+        bn = self.vae.bn
+        eps = self.vae.config.batch_norm_eps
+        z = z * (bn.running_var + eps).sqrt().to(z).view(1, -1, 1, 1) + bn.running_mean.to(z).view(1, -1, 1, 1)
+        b, c, h, w = z.shape
+        z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
+        images = self.vae.decode(z, return_dict=False)[0].clamp(-1, 1)
+        return self.image_processor.postprocess(images, output_type="pil")
+
     @torch.no_grad()
     def __call__(self, prompt=None, *, height=1024, width=1024, num_inference_steps=50,
                  guidance_scale=3.0, negative_prompt="", num_images_per_prompt=1,
@@ -308,9 +321,10 @@ class MOSSImagePipeline(DiffusionPipeline):
                  max_sequence_length=4096, output_type="pil", return_dict=True,
                  uncond_skip_layers=(22,), slg_layers=None, slg_scale=0.0,
                  slg_start=0.0, slg_stop=1.0, image_latents=None, strength=1.0,
-                 mask=None, callback=None):
+                 mask=None, callback=None, preview_callback=None, preview_steps=0):
         """image_latents: img2img 起点（encode_image 的输出）；strength: 重绘幅度；
-        mask: latent 分辨率 [B,1,h,w]，1 = 重绘，0 = 保留原图；callback(i, total): 每步回调。"""
+        mask: latent 分辨率 [B,1,h,w]，1 = 重绘，0 = 保留原图；callback(i, total): 每步回调；
+        preview_callback(image, step, total): 生成中预览，每 preview_steps 步解码一次。"""
         uncond_skip_layers = _validate_skip_layers(
             uncond_skip_layers, len(self.transformer.layers), "uncond_skip_layers"
         )
@@ -407,18 +421,29 @@ class MOSSImagePipeline(DiffusionPipeline):
                 latents = mask * latents + (1 - mask) * (sigma_next * noise + (1 - sigma_next) * clean)
             if callback is not None:
                 callback(offset + 1, len(run))
+            if preview_callback is not None and preview_steps > 0:
+                step_number = offset + 1
+                if step_number == 1 or step_number % preview_steps == 0:
+                    try:
+                        preview_callback(self.decode_latents(latents)[0], step_number, len(run))
+                    except Exception as error:  # 预览失败不能中断生成
+                        print(f"[MOSS-Image] 生成中预览失败，已关闭预览：{error}")
+                        preview_callback = None
         if output_type == "latent":
             images = latents
         else:
             if self.vae is None:
                 raise ValueError("A FLUX.2 VAE is required for decoded output.")
-            z = latents.to(dtype=self.vae.dtype)
-            bn = self.vae.bn
-            eps = self.vae.config.batch_norm_eps
-            z = z * (bn.running_var + eps).sqrt().to(z).view(1, -1, 1, 1) + bn.running_mean.to(z).view(1, -1, 1, 1)
-            b, c, h, w = z.shape
-            z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
-            images = self.vae.decode(z, return_dict=False)[0].clamp(-1, 1)
-            images = self.image_processor.postprocess(images, output_type=output_type)
+            if output_type == "pil":
+                images = self.decode_latents(latents)
+            else:
+                z = latents.to(dtype=self.vae.dtype)
+                bn = self.vae.bn
+                eps = self.vae.config.batch_norm_eps
+                z = z * (bn.running_var + eps).sqrt().to(z).view(1, -1, 1, 1) + bn.running_mean.to(z).view(1, -1, 1, 1)
+                b, c, h, w = z.shape
+                z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
+                images = self.vae.decode(z, return_dict=False)[0].clamp(-1, 1)
+                images = self.image_processor.postprocess(images, output_type=output_type)
         self.maybe_free_model_hooks()
         return ImagePipelineOutput(images=images) if return_dict else (images,)

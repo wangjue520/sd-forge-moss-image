@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import json
 import math
 import os
 from pathlib import Path
@@ -22,7 +21,14 @@ from torch.nn import functional as F
 from lib_moss_image.download import (
     CATALOG, MEMORY_HINT, SOURCES, TURBO_LORA, TURBO_STEPS, download_items, gpu_info, item_choices, recommend,
 )
-from lib_moss_image.layout import validate_layout
+from lib_moss_image import inpaint
+from lib_moss_image.layout import (
+    compile_text as compile_layout_text,
+    looks_like_layout,
+    normalize_layout_prompt,
+    rescale_layout,
+    validate_layout,
+)
 from lib_moss_image.pipeline import Interrupted
 from lib_moss_image import checkpoints
 from lib_moss_image.runtime import MODEL_NAMES, available_configs, available_models, manager, model_roots, models_root, parse_layers
@@ -59,6 +65,9 @@ DEFAULT_OPTIONS = {
     "memory_mode": "model",
     "keep_loaded": False,
     "turbo": False,
+    "only_masked": True,
+    "live_preview": True,
+    "preview_every": 5,
 }
 
 
@@ -125,14 +134,16 @@ def lora_text(loras):
 
 # ---------------------------------------------------------------- Layout
 
-def rescale_layout(prompt, width, height, target_w, target_h):
-    """Hires 第二遍画布变大：按比例缩放 abs_centralized 像素坐标。"""
-    layout = json.loads(prompt)
-    sy, sx = target_h / height, target_w / width
-    for item in layout["items"]:
-        y1, x1, y2, x2 = item["bbox"]
-        item["bbox"] = [round(y1 * sy), round(x1 * sx), round(y2 * sy), round(x2 * sx)]
-    return json.dumps(layout, ensure_ascii=False, separators=(",", ":"))
+def compile_layout_ui(text):
+    """Gradio「编译草稿」按钮：只做格式转换，尺寸留到生成时再校验。"""
+    try:
+        compiled = compile_layout_text(text)
+    except Exception as error:
+        return text, f"编译失败：{error}"
+    return compiled, (
+        "已编译为 MOSS 最终格式（`abs_centralized` / `yxyx`）。"
+        "点编辑器里的「写入正向提示词」或手动粘贴到正向提示词即可。"
+    )
 
 
 # ---------------------------------------------------------------- 图像工具
@@ -192,6 +203,8 @@ def make_infotext(p, index, prompt, settings, extra):
         "MOSS memory": settings["memory_mode"],
         "MOSS keep loaded": bool(settings["keep_loaded"]),
         "MOSS turbo": True if settings["turbo"] else None,
+        "MOSS only masked": settings.get("only_masked"),
+        "MOSS preview": settings.get("preview_every") if settings.get("live_preview") else None,
         "MOSS LoRA": settings["lora_text"],
     }
     text = ", ".join(
@@ -222,6 +235,65 @@ def _step_callback(step, total):
         raise Interrupted()
 
 
+def _preview_callback(image, step, total):
+    """把当前 latent 解码出的小图交给 Forge 的进度预览。"""
+    if not getattr(opts, "live_previews_enable", True):
+        return
+    try:
+        if max(image.size) > 512:
+            image = image.copy()
+            image.thumbnail((512, 512), Image.LANCZOS)
+        if hasattr(state, "assign_current_image"):
+            state.assign_current_image(image)
+        else:
+            state.current_image = image
+            if hasattr(state, "id_live_preview"):
+                state.id_live_preview += 1
+        state.current_image_sampling_step = int(step)
+    except Exception:
+        # 不同 Forge Neo 版本的 State 字段可能不同，预览失败不影响生成。
+        pass
+
+
+def _latent_mask(mask_image, width, height):
+    pixel = torch.from_numpy(np.asarray(mask_image.convert("L"), dtype=np.float32) / 255.0)
+    return F.interpolate(pixel[None, None], size=(height // 16, width // 16), mode="area")
+
+
+def generate_only_masked(
+    p, init, pixel_mask, *, prompt, negative_prompt, loras, shift, common,
+    steps, guidance_scale, seed,
+):
+    """裁剪蒙版区域重绘，再贴回原图；pixel_mask 为整图 [H,W] 0~1。"""
+    mask_array = pixel_mask.numpy()
+    bbox = inpaint.mask_bbox(mask_array)
+    if bbox is None:
+        return init
+
+    padding = int(getattr(p, "inpaint_full_res_padding", 32) or 0)
+    region = inpaint.expand_bbox(bbox, padding, p.width, p.height)
+    mask_image = Image.fromarray(np.clip(mask_array * 255 + 0.5, 0, 255).astype(np.uint8), "L")
+    crop_image, crop_mask = inpaint.crop_pair(init, mask_image, region, p.width, p.height)
+    crop_latent = manager.encode_image(
+        common["model"], common["offload"], to_tensor(crop_image),
+        common["dit"], common["te"], common["vae"],
+    )
+    crop_mask_latent = _latent_mask(crop_mask, p.width, p.height)
+    generated = manager.generate(
+        model=common["model"], offload=common["offload"], dit=common["dit"],
+        te=common["te"], vae=common["vae"], shift=shift, loras=loras,
+        prompt=prompt, negative_prompt=negative_prompt,
+        height=p.height, width=p.width, num_inference_steps=steps,
+        guidance_scale=guidance_scale, generator=torch.Generator(device="cpu").manual_seed(seed),
+        image_latents=crop_latent, strength=float(p.denoising_strength),
+        mask=crop_mask_latent,
+        **{k: v for k, v in common.items() if k not in ("model", "offload", "dit", "te", "vae")},
+    )[0]
+    patched = inpaint.paste_crop(init, generated, region)
+    # 用原始整图蒙版收边，保证蒙版外一个像素都不变。
+    return inpaint.composite_with_mask(init, patched, mask_image)
+
+
 @torch.inference_mode()
 def process_moss(p):
     """PROCESS_HOOKS 入口：替代 process_images，返回标准 Processed。"""
@@ -230,6 +302,9 @@ def process_moss(p):
     slg_mode, memory_mode = options["slg_mode"], options["memory_mode"]
     keep_loaded = bool(options["keep_loaded"])
     turbo = bool(options["turbo"])
+    only_masked = bool(options.get("only_masked", True))
+    live_preview = bool(options.get("live_preview", True))
+    preview_steps = max(1, min(50, int(options.get("preview_every", 5) or 5)))
     # 模型来自顶部 Checkpoint（API 可用 override_settings.sd_model_checkpoint 指定）
     info = checkpoints.selected_checkpoint(p)
     if info is None:
@@ -282,8 +357,12 @@ def process_moss(p):
     loras = resolve_loras(network_data)
     if turbo:
         loras = add_turbo_lora(loras)
-    for prompt in prompts:
-        validate_layout(prompt, p.width, p.height)
+    for index, prompt in enumerate(prompts):
+        normalized, message = normalize_layout_prompt(prompt, p.width, p.height)
+        if message:
+            print(f"[MOSS-Image] {message}")
+        validate_layout(normalized, p.width, p.height)
+        prompts[index] = normalized
 
     hires = not is_img2img and bool(getattr(p, "enable_hr", False))
     hr_extra = {}
@@ -292,6 +371,11 @@ def process_moss(p):
         hr_w, hr_h = align_16(p.hr_upscale_to_x), align_16(p.hr_upscale_to_y)
         hr_steps = int(p.hr_second_pass_steps or p.steps)
         hr_prompts, hr_network_data = extra_networks.parse_prompts(list(p.all_hr_prompts))
+        for index, prompt in enumerate(hr_prompts):
+            normalized, message = normalize_layout_prompt(prompt, p.width, p.height)
+            if message:
+                print(f"[MOSS-Image] Hires {message}")
+            hr_prompts[index] = normalized
         hr_loras = resolve_loras(hr_network_data)
         if turbo:
             hr_loras = add_turbo_lora(hr_loras)
@@ -307,25 +391,36 @@ def process_moss(p):
     if is_img2img:
         if not p.init_images:
             raise ValueError("img2img 需要输入图像。")
-        if p.image_mask is not None and p.inpaint_full_res:
-            print("[MOSS-Image] 「仅重绘蒙版区域」暂不支持，按整图重绘并保留蒙版外区域。")
         hr_extra = {"Denoising strength": float(p.denoising_strength)}
         if p.image_mask is not None:
             hr_extra["Mask blur"] = int(p.mask_blur)
+            hr_extra["MOSS inpaint"] = "only masked" if (only_masked or getattr(p, "inpaint_full_res", False)) else "full image"
 
     settings = {
         "model": model, "shift": shift, "slg_mode": slg_mode, "layers": layers,
         "memory_mode": memory_mode, "keep_loaded": keep_loaded, "turbo": turbo,
         "lora_text": lora_text(loras), "te": te, "vae": vae,
         "checkpoint": info.name,
+        "only_masked": only_masked if is_img2img else None,
+        "live_preview": live_preview, "preview_every": preview_steps,
     }
-    common = dict(model=model, offload=memory_mode, dit=dit, te=te, vae=vae, num_images_per_prompt=1,
-                  callback=_step_callback, **_slg_kwargs(slg_mode, layers))
+    common = dict(
+        model=model, offload=memory_mode, dit=dit, te=te, vae=vae, num_images_per_prompt=1,
+        callback=_step_callback,
+        preview_callback=_preview_callback if (live_preview and getattr(opts, "live_previews_enable", True)) else None,
+        preview_steps=preview_steps, **_slg_kwargs(slg_mode, layers),
+    )
 
     # 首次接管时通过 Neo 自带接口完整卸载 Forge 当前模型。
     sd_models.unload_model_weights()
     output_images, infotexts = [], []
     state.job_count = total
+    if live_preview:
+        try:
+            state.current_image = None
+            state.current_image_sampling_step = 0
+        except Exception:
+            pass
     try:
         for index in range(total):
             if state.interrupted or state.stopping_generation:
@@ -339,17 +434,25 @@ def process_moss(p):
                     init = p.init_images[index % len(p.init_images)].convert("RGB")
                     init = images.resize_image(p.resize_mode, init, p.width, p.height)
                     pixel_mask, latent_mask = prepare_mask(p, p.width, p.height)
-                    clean = manager.encode_image(model, memory_mode, to_tensor(init), dit, te, vae)
-                    image = manager.generate(
-                        shift=shift, loras=loras, prompt=prompts[index],
-                        negative_prompt=p.all_negative_prompts[index],
-                        height=p.height, width=p.width, num_inference_steps=int(p.steps),
-                        guidance_scale=float(p.cfg_scale),
-                        generator=torch.Generator(device="cpu").manual_seed(seed),
-                        image_latents=clean, strength=float(p.denoising_strength), mask=latent_mask, **common,
-                    )[0]
-                    if pixel_mask is not None:
-                        image = composite(init, image, pixel_mask)
+                    if pixel_mask is not None and (only_masked or getattr(p, "inpaint_full_res", False)):
+                        image = generate_only_masked(
+                            p, init, pixel_mask, prompt=prompts[index],
+                            negative_prompt=p.all_negative_prompts[index], loras=loras,
+                            shift=shift, common=common, steps=int(p.steps),
+                            guidance_scale=float(p.cfg_scale), seed=seed,
+                        )
+                    else:
+                        clean = manager.encode_image(model, memory_mode, to_tensor(init), dit, te, vae)
+                        image = manager.generate(
+                            shift=shift, loras=loras, prompt=prompts[index],
+                            negative_prompt=p.all_negative_prompts[index],
+                            height=p.height, width=p.width, num_inference_steps=int(p.steps),
+                            guidance_scale=float(p.cfg_scale),
+                            generator=torch.Generator(device="cpu").manual_seed(seed),
+                            image_latents=clean, strength=float(p.denoising_strength), mask=latent_mask, **common,
+                        )[0]
+                        if pixel_mask is not None:
+                            image = composite(init, image, pixel_mask)
                 else:
                     image = manager.generate(
                         shift=shift, loras=loras, prompt=prompts[index],
@@ -370,7 +473,7 @@ def process_moss(p):
                             upscaler = None
                         upscaled = images.resize_image(0, image, hr_w, hr_h, upscaler_name=upscaler)
                         hr_prompt = hr_prompts[index]
-                        if validate_layout(hr_prompt, p.width, p.height) is not None:
+                        if looks_like_layout(hr_prompt):
                             hr_prompt = rescale_layout(hr_prompt, p.width, p.height, hr_w, hr_h)
                         clean = manager.encode_image(model, memory_mode, to_tensor(upscaled), dit, te, vae)
                         image = manager.generate(
@@ -696,6 +799,46 @@ class MOSSImagePanel(scripts.Script):
                     inputs=[turbo], outputs=[self.sliders["steps"], self.sliders["cfg_scale"]],
                     queue=False, show_progress=False,
                 )
+            with gr.Row():
+                live_preview = gr.Checkbox(
+                    value=True, label="生成中预览", scale=2,
+                    info="采样过程中解码几张缩略图，显示在进度条区域；会增加少量显存和时间。",
+                )
+                preview_every = gr.Slider(
+                    minimum=1, maximum=20, value=5, step=1, label="预览间隔（步）", scale=2,
+                    info="每隔多少步解码一次；1 = 每步都预览，最费显存。",
+                )
+            if is_img2img:
+                only_masked = gr.Checkbox(
+                    value=True, label="局部重绘：只裁剪蒙版区域重绘", scale=3,
+                    info="勾选后只把蒙版包围盒裁出来、放大到当前分辨率重绘，再贴回原图；"
+                         "小区域细节更好、速度更快。取消则整图带蒙版重绘。",
+                )
+            else:
+                only_masked = gr.Checkbox(value=True, visible=False)
+            with gr.Accordion("Layout 编辑器（可视化排版）", open=False):
+                gr.HTML(f'<div class="moss-layout-editor" data-tab="{tab}"></div>')
+                with gr.Accordion("高级：Layout JSON 与编译", open=False):
+                    layout_json = gr.Textbox(
+                        value="", label="Layout JSON（草稿 / 编译结果）", lines=4,
+                        elem_id=f"moss_layout_{tab}_json", elem_classes=["moss-layout-json"],
+                        placeholder='在这里粘贴官方草稿（abs / xyxy）或最终 Layout；'
+                                    '也可以直接用上方画布画框后点「写入正向提示词」。',
+                    )
+                    with gr.Row():
+                        compile_layout = gr.Button("编译草稿 JSON", variant="secondary")
+                        compile_status = gr.Markdown()
+                    compile_layout.click(
+                        compile_layout_ui, inputs=[layout_json], outputs=[layout_json, compile_status],
+                        queue=False, show_progress=False,
+                    )
+                gr.Markdown(
+                    "在画布上拖拽画框，双击框编辑类型 / 描述 / 文字；"
+                    "**写入正向提示词** 会把编译后的 JSON 放进正向提示词。"
+                    "草稿格式（`abs / xyxy`）会由生成流程自动编译；"
+                    "需要检查原始 JSON 时展开上面的「高级」。"
+                    "从别处复制来的 JSON，可以点画布上方的「导入 JSON」直接还原成框。"
+                )
             gr.Markdown(
                 "**使用说明**\n\n"
                 "- 模型在顶部 **Checkpoint** 里选：`MOSS-Image-SFT`（推荐，出图更规整）/ `MOSS-Image-Base`（原始底模），"
@@ -704,7 +847,8 @@ class MOSSImagePanel(scripts.Script):
                 "- 步数 / CFG / Shift 用页面上原有的滑块（官方推荐 50 / 3 / 5），宽高会自动对齐到 16 的倍数。\n"
                 "- LoRA：提示词里写 `<lora:文件名:权重>`。\n"
                 "- 想快：勾上面的「8 步加速模式」（第一次先点「下载加速 LoRA」）。\n"
-                "- 排版（Layout）：把官方格式的 JSON 直接粘贴到正向提示词，宽高要和 JSON 里的画布一致。"
+                "- 排版（Layout）：打开「Layout 编辑器」直接画框，点「写入正向提示词」；"
+                "也可以把官方格式 JSON 粘贴到正向提示词，宽高要和 JSON 里的画布一致。"
             )
             with gr.Accordion("模型下载", open=False):
                 gr.Markdown(recommendation_text())
@@ -745,7 +889,7 @@ class MOSSImagePanel(scripts.Script):
         self.paste_field_names = ["MOSS SLG mode", "MOSS SLG layers", "MOSS memory", "MOSS keep loaded", "MOSS turbo"]
         # 重载 UI 会重新建面板：同一个标签页只保留最新的一组
         PANELS[:] = [pair for pair in PANELS if pair[0].elem_id != self.panel.elem_id] + [(self.panel, self.current)]
-        return [slg_mode, layers, memory_mode, keep_loaded, turbo]
+        return [slg_mode, layers, memory_mode, keep_loaded, turbo, only_masked, live_preview, preview_every]
 
     def after_component(self, component, **kwargs):
         # 原生步数 / CFG 滑块在面板之前创建，这里记下来给加速模式开关联动
@@ -754,11 +898,17 @@ class MOSSImagePanel(scripts.Script):
             if kwargs.get("elem_id") == f"{tab}_{name}":
                 self.sliders[name] = component
 
-    def before_process(self, p, slg_mode="negative", layers="22", memory_mode="model", keep_loaded=False, turbo=False):
+    def before_process(
+        self, p, slg_mode="negative", layers="22", memory_mode="model", keep_loaded=False,
+        turbo=False, only_masked=True, live_preview=True, preview_every=5,
+    ):
         p.moss_options = {
             "slg_mode": slg_mode,
             "layers": layers,
             "memory_mode": memory_mode,
             "keep_loaded": keep_loaded,
             "turbo": turbo,
+            "only_masked": bool(only_masked),
+            "live_preview": bool(live_preview),
+            "preview_every": int(preview_every or 5),
         }

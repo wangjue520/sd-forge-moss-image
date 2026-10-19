@@ -1,0 +1,518 @@
+/* MOSS-Image visual Layout editor */
+.moss-layout-editor,
+.mle-modal-shade {
+  --mle-bg: #f6f8f9;
+  --mle-card: #ffffff;
+  --mle-card-2: #f0f4f6;
+  --mle-line: #d8e0e4;
+  --mle-line-strong: #b9c7cd;
+  --mle-text: #1d2a30;
+  --mle-muted: #66777f;
+  --mle-accent: #236b7a;
+  --mle-accent-soft: #e2f0f2;
+  --mle-danger: #b44444;
+  --mle-canvas: #e9eff2;
+  --mle-grid: rgba(29, 42, 48, 0.07);
+  --mle-shadow: 0 1px 2px rgba(29, 42, 48, 0.06);
+  --mle-tag-text: #101619;
+}
+
+html.dark .moss-layout-editor,
+body.dark .moss-layout-editor,
+.dark .moss-layout-editor,
+.moss-layout-editor.mle-dark,
+html.dark .mle-modal-shade,
+body.dark .mle-modal-shade,
+.dark .mle-modal-shade,
+.mle-modal-shade.mle-dark {
+  --mle-bg: #151b1e;
+  --mle-card: #1b2327;
+  --mle-card-2: #222c31;
+  --mle-line: rgba(255, 255, 255, 0.12);
+  --mle-line-strong: rgba(255, 255, 255, 0.24);
+  --mle-text: #d8e1e4;
+  --mle-muted: #8d9ca2;
+  --mle-accent: #8fc3cc;
+  --mle-accent-soft: rgba(143, 195, 204, 0.12);
+  --mle-danger: #e08a8a;
+  --mle-canvas: #0f1416;
+  --mle-grid: rgba(255, 255, 255, 0.06);
+  --mle-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --mle-tag-text: #101619;
+}
+
+.moss-layout-editor {
+  width: 100%;
+  color: var(--mle-text);
+  background: var(--mle-bg);
+  border: 1px solid var(--mle-line);
+  border-radius: 10px;
+  padding: 10px;
+  font: 12px/1.45 "Segoe UI", system-ui, sans-serif;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.moss-layout-editor *,
+.mle-modal-shade * { box-sizing: border-box; }
+
+/* toolbar */
+.moss-layout-editor .mle-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.moss-layout-editor .mle-toolbar-left,
+.moss-layout-editor .mle-toolbar-right {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.moss-layout-editor .mle-toolbar-right { margin-left: auto; }
+.moss-layout-editor .mle-size-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--mle-line);
+  border-radius: 999px;
+  background: var(--mle-card);
+  color: var(--mle-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.moss-layout-editor .mle-upload {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px dashed var(--mle-line-strong);
+  border-radius: 7px;
+  color: var(--mle-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.moss-layout-editor .mle-upload:hover { color: var(--mle-text); border-color: var(--mle-accent); }
+.moss-layout-editor .mle-file { display: none; }
+.moss-layout-editor .mle-btn {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--mle-line);
+  border-radius: 7px;
+  background: var(--mle-card);
+  color: var(--mle-text);
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+  box-shadow: var(--mle-shadow);
+}
+.moss-layout-editor .mle-btn:hover { border-color: var(--mle-accent); }
+.moss-layout-editor .mle-btn:focus-visible,
+.moss-layout-editor .mle-upload:focus-visible,
+.moss-layout-editor .mle-row-main:focus-visible {
+  outline: 2px solid var(--mle-accent);
+  outline-offset: 1px;
+}
+.moss-layout-editor .mle-btn.quiet { background: transparent; box-shadow: none; }
+.moss-layout-editor .mle-btn.small { height: 24px; padding: 0 8px; font-size: 11px; }
+.moss-layout-editor .mle-btn.primary {
+  background: var(--mle-accent);
+  border-color: var(--mle-accent);
+  color: #fff;
+  font-weight: 600;
+}
+html.dark .moss-layout-editor .mle-btn.primary,
+body.dark .moss-layout-editor .mle-btn.primary,
+.dark .moss-layout-editor .mle-btn.primary,
+.moss-layout-editor.mle-dark .mle-btn.primary { color: #102024; }
+.moss-layout-editor .mle-btn.danger { color: var(--mle-danger); }
+
+/* main grid */
+.moss-layout-editor .mle-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(230px, 1fr);
+  gap: 9px;
+  align-items: start;
+}
+.moss-layout-editor .mle-canvas-col { min-width: 0; max-width: 640px; }
+.moss-layout-editor .mle-frame {
+  position: relative;
+  width: 100%;
+  margin: 0 auto;
+  aspect-ratio: 1 / 1;
+  background-color: var(--mle-canvas);
+  background-image:
+    linear-gradient(var(--mle-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--mle-grid) 1px, transparent 1px);
+  background-size: 10% 10%;
+  border: 1px solid var(--mle-line);
+  border-radius: 8px;
+  box-shadow: var(--mle-shadow);
+  overflow: hidden;
+  touch-action: none;
+  cursor: crosshair;
+}
+.moss-layout-editor .mle-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  display: none;
+  pointer-events: none;
+}
+.moss-layout-editor .mle-boxes { position: absolute; inset: 0; }
+.moss-layout-editor .mle-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  color: var(--mle-muted);
+  pointer-events: none;
+  text-align: center;
+  padding: 12px;
+}
+.moss-layout-editor .mle-hint-title { font-size: 14px; font-weight: 600; color: var(--mle-text); opacity: 0.7; }
+.moss-layout-editor .mle-hint-sub { font-size: 11px; opacity: 0.8; }
+.moss-layout-editor .mle-box {
+  position: absolute;
+  border: 2px solid #e0b34a;
+  cursor: move;
+  min-width: 2px;
+  min-height: 2px;
+}
+.moss-layout-editor .mle-box.selected {
+  box-shadow: 0 0 0 1px #fff inset, 0 0 0 2px rgba(35, 107, 122, 0.35);
+}
+.moss-layout-editor .mle-tag {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 3px;
+  color: var(--mle-tag-text);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 18px;
+  white-space: nowrap;
+  max-width: calc(100% - 4px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.moss-layout-editor .mle-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: #fff;
+  border: 2px solid #e0b34a;
+  border-radius: 2px;
+  z-index: 2;
+}
+.moss-layout-editor .mle-handle.nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.moss-layout-editor .mle-handle.ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.moss-layout-editor .mle-handle.sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.moss-layout-editor .mle-handle.se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.moss-layout-editor .mle-status {
+  min-height: 18px;
+  margin-top: 6px;
+  color: var(--mle-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.moss-layout-editor .mle-status::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--mle-accent);
+  vertical-align: 1px;
+}
+.moss-layout-editor .mle-status.error { color: var(--mle-danger); }
+.moss-layout-editor .mle-status.error::before { background: var(--mle-danger); }
+
+/* side cards */
+.moss-layout-editor .mle-side {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.moss-layout-editor .mle-card {
+  background: var(--mle-card);
+  border: 1px solid var(--mle-line);
+  border-radius: 8px;
+  padding: 8px;
+  box-shadow: var(--mle-shadow);
+}
+.moss-layout-editor .mle-card > .mle-card-title {
+  margin-bottom: 5px;
+}
+.moss-layout-editor .mle-card-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--mle-text);
+  letter-spacing: 0.02em;
+}
+.moss-layout-editor .mle-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.moss-layout-editor .mle-card-head .mle-card-title { flex: 1; }
+.moss-layout-editor .mle-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--mle-accent-soft);
+  color: var(--mle-accent);
+  font-size: 10px;
+  font-weight: 700;
+}
+.moss-layout-editor .mle-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--mle-muted);
+  font-size: 10px;
+}
+.moss-layout-editor textarea,
+.moss-layout-editor input,
+.moss-layout-editor select {
+  width: 100%;
+  background: var(--mle-card-2);
+  color: var(--mle-text);
+  border: 1px solid var(--mle-line);
+  border-radius: 6px;
+  padding: 5px 6px;
+  font: inherit;
+}
+.moss-layout-editor textarea:focus,
+.moss-layout-editor input:focus,
+.moss-layout-editor select:focus {
+  outline: none;
+  border-color: var(--mle-accent);
+  box-shadow: 0 0 0 2px var(--mle-accent-soft);
+}
+.moss-layout-editor textarea { resize: vertical; }
+.moss-layout-editor .mle-summary { min-height: 64px; }
+.moss-layout-editor .mle-field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px;
+  gap: 6px;
+}
+.moss-layout-editor .mle-field { min-width: 0; }
+.moss-layout-editor .mle-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 190px;
+  overflow: auto;
+  padding-right: 2px;
+}
+.moss-layout-editor .mle-empty {
+  color: var(--mle-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 8px 4px;
+}
+.moss-layout-editor .mle-row-item {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+.moss-layout-editor .mle-row-item:hover { background: var(--mle-card-2); }
+.moss-layout-editor .mle-row-item.selected {
+  border-color: var(--mle-line-strong);
+  background: var(--mle-accent-soft);
+}
+.moss-layout-editor .mle-row-main {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--mle-text);
+  text-align: left;
+  padding: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+.moss-layout-editor .mle-row-num {
+  flex: 0 0 18px;
+  height: 18px;
+  border-radius: 4px;
+  color: var(--mle-tag-text);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+.moss-layout-editor .mle-row-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.moss-layout-editor .mle-row-edit,
+.moss-layout-editor .mle-row-del {
+  background: transparent;
+  border: 0;
+  color: var(--mle-muted);
+  cursor: pointer;
+  padding: 0 5px;
+  font-size: 14px;
+}
+.moss-layout-editor .mle-row-edit {
+  align-self: center;
+  margin: 3px 2px;
+  padding: 1px 5px;
+  font-size: 10px;
+  color: var(--mle-accent);
+  border: 1px solid var(--mle-line);
+  border-radius: 4px;
+}
+.moss-layout-editor .mle-row-edit:hover { color: var(--mle-accent); border-color: var(--mle-accent); }
+
+.moss-layout-editor .mle-summary-card summary {
+  cursor: pointer;
+  color: var(--mle-muted);
+  font-size: 11px;
+  font-weight: 600;
+  list-style-position: inside;
+}
+.moss-layout-editor .mle-summary-card summary:hover { color: var(--mle-text); }
+.moss-layout-editor .mle-readable {
+  margin: 6px 0 0;
+  padding: 7px;
+  max-height: 170px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--mle-card-2);
+  border: 1px solid var(--mle-line);
+  border-radius: 6px;
+  color: var(--mle-text);
+  font: 11px/1.5 "Segoe UI", system-ui, sans-serif;
+}
+.moss-layout-editor .mle-row-del { font-size: 15px; }
+.moss-layout-editor .mle-row-del:hover { color: var(--mle-danger); }
+
+/* advanced JSON textbox outside the editor card */
+.moss-layout-json textarea {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* modal */
+.mle-modal-shade {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  background: rgba(10, 16, 19, 0.55);
+  display: grid;
+  place-items: center;
+  padding: 14px;
+}
+.mle-modal {
+  width: min(430px, 100%);
+  max-height: calc(100vh - 28px);
+  overflow: auto;
+  background: var(--mle-card);
+  border: 1px solid var(--mle-line);
+  border-radius: 12px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.3);
+  padding: 14px;
+  color: var(--mle-text);
+  font: 12px/1.45 "Segoe UI", system-ui, sans-serif;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.mle-modal h3 { margin: 0 0 2px; font-size: 14px; }
+.mle-modal .mle-modal-field { display: flex; flex-direction: column; gap: 4px; color: var(--mle-muted); }
+.mle-modal textarea,
+.mle-modal input,
+.mle-modal select {
+  background: var(--mle-card-2);
+  color: var(--mle-text);
+  border: 1px solid var(--mle-line);
+  border-radius: 6px;
+  padding: 7px;
+  font: inherit;
+}
+.mle-modal textarea:focus,
+.mle-modal input:focus,
+.mle-modal select:focus {
+  outline: none;
+  border-color: var(--mle-accent);
+  box-shadow: 0 0 0 2px var(--mle-accent-soft);
+}
+.mle-modal .mle-modal-help {
+  color: var(--mle-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.mle-modal .mle-import-text {
+  min-height: 220px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.mle-modal .mle-import-error {
+  min-height: 16px;
+  color: var(--mle-danger);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+.mle-modal .mle-modal-text-wrap { display: none; }
+.mle-modal .mle-modal-actions { display: flex; align-items: center; gap: 7px; margin-top: 4px; }
+.mle-modal .mle-spacer { flex: 1; }
+.mle-modal .mle-btn {
+  height: 30px;
+  padding: 0 11px;
+  background: var(--mle-card-2);
+  color: var(--mle-text);
+  border: 1px solid var(--mle-line);
+  border-radius: 7px;
+  cursor: pointer;
+  font: inherit;
+}
+.mle-modal .mle-btn.primary {
+  background: var(--mle-accent);
+  border-color: var(--mle-accent);
+  color: #fff;
+  font-weight: 600;
+}
+html.dark .mle-modal .mle-btn.primary,
+body.dark .mle-modal .mle-btn.primary,
+.dark .mle-modal .mle-btn.primary,
+.mle-modal-shade.mle-dark .mle-modal .mle-btn.primary { color: #102024; }
+.mle-modal .mle-btn.danger { color: var(--mle-danger); }
+
+@media (max-width: 720px) {
+  .moss-layout-editor .mle-main { grid-template-columns: 1fr; }
+  .moss-layout-editor .mle-canvas-col { max-width: 100%; margin: 0 auto; }
+  .moss-layout-editor .mle-list { max-height: 150px; }
+  .moss-layout-editor .mle-toolbar-right { margin-left: 0; }
+  .moss-layout-editor .mle-toolbar-left,
+  .moss-layout-editor .mle-toolbar-right { width: 100%; }
+}

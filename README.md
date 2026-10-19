@@ -5,6 +5,8 @@
 
 扩展只使用 Forge 已有的依赖（不升级 torch / transformers / diffusers），Qwen3.5 文本编码器以纯 PyTorch 实现。
 
+> **完整使用指南：** [GUIDE.md](GUIDE.md)（安装、模型、Layout 编辑器、导入 JSON、局部重绘、LoRA、量化、常见问题）
+
 ## 安装
 
 **方式一（推荐）**：用 [WWY 启动器](https://github.com/wangjue520/forge-webui-launcher)的「常用插件」页勾选 MOSS-Image 安装。
@@ -52,7 +54,7 @@ F:\mod\
 | 顶部 **Checkpoint** | 只列 MOSS 模型：`MOSS-Image-SFT`（推荐）、`MOSS-Image-Base`、压缩版（Q8_0 / int8 / int4） |
 | 顶部 **VAE / Text Encoder** | 不选 = 用官方原版；可选压缩版文本编码器、MOSS VAE 单文件。选了不适用的（SDXL VAE、T5 等）会在面板提示并忽略 |
 | 原生参数 | 提示词、负向提示词（官方推荐留空）、步数、CFG、Shift、宽高（自动对齐 16）、seed、批次 |
-| MOSS-Image 面板 | 显存使用方式、结构增强（SLG）、生成完不卸载模型、8 步加速模式、模型下载、制作压缩版 |
+| MOSS-Image 面板 | 显存使用方式、结构增强（SLG）、生成完不卸载模型、8 步加速模式、生成中预览、可视化 Layout 编辑器、模型下载、制作压缩版 |
 
 ### 面板选项
 
@@ -62,6 +64,10 @@ F:\mod\
   - 逐层搬运：显存最省，速度很慢，给小显存显卡用。
 - **结构增强（SLG）**：官方推荐的技巧（负向分支跳过第 22 层），让结构、手部更稳定，保持默认即可。
 - **生成完不卸载模型**：连续出图时省去每次约 30 秒的加载；切到其他模型时自动释放。
+- **生成中预览**：采样过程中每隔 N 步解码一张缩略图，显示在 Forge 的进度条区域；默认 5 步。
+  预览会多占一点显存和时间，小显存可以关掉或把间隔调大。
+- **局部重绘：只裁剪蒙版区域**（img2img）：勾选后只把蒙版包围盒裁出来、放大到当前分辨率重绘，再贴回原图；
+  比整图带蒙版重绘更适合小区域，细节更好、速度更快。取消则退回整图重绘。
 
 ### 8 步加速模式
 
@@ -83,11 +89,58 @@ Hires. fix 第二遍同样处理。适用于 SFT 及其压缩版（INT8 / GGUF �
 - **Hires. fix**：用原生的 Hires. fix。Latent 放大方式会自动改为 Lanczos 像素放大
   （MOSS 的 latent 不是普通 4 通道格式）。
 - **img2img / 局部重绘**：原生 img2img 标签页。官方没有提供编辑模型，这里采用「VAE 编码 → 按重绘幅度加噪 → 重绘」；
-  局部重绘在每步把蒙版外区域替换回原图，结束后再按蒙版合成。
-- **Layout 排版**：把官方格式 JSON（`bbox_coord_space: abs_centralized`、`bbox_format: yxyx`）直接粘贴到正向提示词，
-  原样传给模型。宽高必须和 JSON 的画布一致，超出画布、格式不对会给出具体错误提示；Hires 第二遍会按比例缩放坐标。
-- **中断 / 跳过 / 进度条**：原生按钮即可，进度条显示采样步数。
-- **PNG 图片信息**：完整记录模型、压缩版文件、SLG、LoRA 等参数，可读回并发送到 txt2img。
+  局部重绘支持**真正的 only-masked 裁剪重绘**：求蒙版包围盒 → 外扩 padding → 裁出并缩放到当前分辨率 →
+  只重绘这一块 → 缩回贴到原图 → 用原始蒙版收边。蒙版外像素保持不变。
+- **Layout 排版**：支持官方最终格式（`bbox_coord_space: abs_centralized`、`bbox_format: yxyx`），
+  也支持可视化编辑器 / 官方 prompt-enhancer 的草稿格式（`abs` / `xyxy`）。草稿会由生成流程**自动编译**，
+  也可以先在面板里点「编译草稿 JSON」检查；JSON 后面的 `<lora:...>` 等标签会保留。
+- **可视化 Layout 编辑器**：在 `txt2img` / `img2img` 的 MOSS 面板里打开「Layout 编辑器」，
+  直接在画布上拖框、双击编辑物体 / 角色 / 文字、写整体描述，点「写入正向提示词」即可。
+- **中断 / 跳过 / 进度条**：原生按钮即可，进度条显示采样步数；生成中预览显示在进度条区域。
+- **PNG 图片信息**：完整记录模型、压缩版文件、SLG、LoRA、局部重绘 / 预览设置等参数，可读回并发送到 txt2img。
+
+### 可视化 Layout 编辑器
+
+在 MOSS 面板展开 **「Layout 编辑器（可视化排版）」**：
+
+1. 画布会跟随当前 `Width` / `Height` 的比例；可以直接在画布上拖拽画框。编辑器会跟随 Forge 的浅色 / 深色主题。
+2. 双击框编辑：**物体 / 角色 / 文字**、描述；文字框还要填写要写进画面的原文。
+3. 右侧填写整体描述（`summary.caption`）、可选的 `meta` 和 `canvas`。
+4. 点 **「写入正向提示词」**：编辑器会把框编译成 MOSS 最终格式并放进正向提示词；原有的 `<lora:...>` 会保留。
+5. 想检查中间结果，点 **「导出草稿 JSON」** 或 **「编译到 JSON 框」**；面板里的「编译草稿 JSON」按钮会做同样的事并给出错误提示。
+6. 也可以把官方 prompt-enhancer 生成的草稿 JSON 直接粘贴到正向提示词，生成时会自动编译。
+7. 从别处复制来的 JSON：点画布上方的 **「导入 JSON」**，粘贴后点「导入画布」，会还原成框；
+   支持草稿（`abs / xyxy`）和最终格式（`abs_centralized / yxyx`），并按当前画布尺寸自动缩放。
+
+草稿格式：
+
+```json
+{
+  "width": 1024,
+  "height": 1024,
+  "bbox_coord_space": "abs",
+  "bbox_format": "xyxy",
+  "summary": {"caption": "A poster", "meta": ["poster"]},
+  "items": [
+    {"label": "object", "caption": "a red fox", "bbox": [100, 200, 300, 400]},
+    {"label": "text", "caption": "title", "text": "FOX", "bbox": [50, 50, 500, 120]}
+  ]
+}
+```
+
+最终格式（编辑器写入提示词的就是这个）：
+
+```json
+{
+  "summary": {"caption": "A poster", "meta": ["poster"]},
+  "items": [
+    {"label": "object", "caption": "a red fox", "bbox": [-312, -412, -112, -212]},
+    {"label": "text", "caption": "title", "text": "FOX", "bbox": [-462, -462, -392, -12]}
+  ],
+  "bbox_coord_space": "abs_centralized",
+  "bbox_format": "yxyx"
+}
+```
 
 ### 压缩版（量化）
 
@@ -143,8 +196,8 @@ Hires. fix 第二遍同样处理。适用于 SFT 及其压缩版（INT8 / GGUF �
 
 ## 已知限制
 
-- img2img「仅重绘蒙版区域」暂不支持（按整图重绘并保留蒙版外内容）。
-- 生成过程中没有中间预览图，只有进度条。
+- 生成中预览需要额外解码 VAE；逐层搬运 / 很小显存时可能解码失败，失败会自动关闭预览，不影响出图。
+- 可视化布局编辑器是扩展自带的轻量画布，不包含官方 ComfyUI 版的所有功能（如逐像素坐标输入、从参考图自动检测框）。
 - 社区 W4A8 GPTQ 文本编码器暂不支持（INT8 版可用）。
 - darask0 / akhaliq 的「4 步加速」适配器除了 LoRA 还带自定义时间嵌入和采样数据，需要专门的采样器，暂不支持
   （其中的 LoRA 部分能加载，但单独使用达不到 4 步出图）。
