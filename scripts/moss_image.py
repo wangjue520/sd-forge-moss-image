@@ -726,8 +726,38 @@ def _top_bar_selection(elem_id, value):
 script_callbacks.on_after_component(wire_top_bar, name="moss_image_top_bar")
 
 
+def leave_moss_checkpoint(p):
+    """非 moss 预设下不让 Forge 去加载 MOSS Checkpoint（它会把官方目录当成单个权重文件读，报 Failed to load diffusion model）。
+
+    页面加载时 Forge 只把顶部下拉框显示成该预设记住的模型，不改实际设置；所以在 moss 预设下关掉 WebUI、
+    之后预设变成别的，或 API 在非 moss 预设下指定了 MOSS Checkpoint，都会出现「界面显示 A、实际加载 MOSS」。
+    这里把 MOSS 的 override 去掉，并把实际 Checkpoint 换成该预设记住的模型（也就是下拉框显示的那个）。"""
+    preset = opts.forge_preset
+    if preset == PRESET or PROCESS_HOOKS.get(preset) is not None:
+        return
+    overrides = getattr(p, "override_settings", None) or {}
+    override = sd_models.checkpoint_aliases.get(overrides.get("sd_model_checkpoint"))
+    if override is not None and checkpoints.is_moss_checkpoint(override):
+        print(f"[MOSS-Image] 当前预设是 {preset}，忽略 MOSS 模型 {override.name}（MOSS 只能在 moss 预设下使用）")
+        overrides.pop("sd_model_checkpoint")
+    current = sd_models.select_checkpoint()
+    if current is None or not checkpoints.is_moss_checkpoint(current):
+        return
+
+    from modules_forge import main_entry
+    from modules_forge.presets import preset_checkpoint_tiles
+
+    tiles = preset_checkpoint_tiles(preset)
+    remembered = getattr(opts, f"forge_checkpoint_{preset}", None)
+    target = remembered if remembered in tiles else (sorted(tiles)[0] if tiles else None)
+    if target is None:
+        raise RuntimeError(f"当前预设是 {preset}，但顶部 Checkpoint 是 MOSS 模型 {current.name}，且没有别的模型可用。请切到 moss 预设再生成。")
+    print(f"[MOSS-Image] 当前预设是 {preset}，Checkpoint 由 MOSS 模型 {current.name} 换回 {target}")
+    main_entry.checkpoint_change(target, preset)
+
+
 class MOSSImageGuard(scripts.Script):
-    """非 moss 预设生成前释放 MOSS，防止两套模型抢显存。"""
+    """非 moss 预设生成前释放 MOSS，防止两套模型抢显存；并确保不会去加载 MOSS Checkpoint。"""
 
     create_group = False
 
@@ -743,6 +773,7 @@ class MOSSImageGuard(scripts.Script):
     def before_process(self, p, *args):
         if manager.loaded and not is_moss_preset():
             manager.release()
+        leave_moss_checkpoint(p)
 
 
 class MOSSImagePanel(scripts.Script):
